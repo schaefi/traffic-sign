@@ -1,0 +1,53 @@
+#!/usr/bin/python3
+
+import os
+import cv2
+import sys
+import argparse
+import socket
+import time
+
+parser = argparse.ArgumentParser(
+    prog='capture',
+    description='Capture From WebCam and Classify',
+    epilog='SUSE Automotive Team'
+)
+
+parser.add_argument('socket_path')
+parser.add_argument('image_output_path')
+
+args = parser.parse_args()
+
+webcam = cv2.VideoCapture(0)
+result, frame = webcam.read()
+if not result:
+    print("No webcam device found")
+    sys.exit(1)
+
+cv2.imwrite(args.image_output_path, frame)
+
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+
+try:
+    sock.connect(args.socket_path)
+except Exception as error:
+    print(f'Failed to connect UDS: {args.socket_path}: {error}')
+    sys.exit(1)
+
+try:
+    while True:
+        try:
+            if result:
+                sock.sendall(args.image_output_path.encode())
+                response = sock.recv(1024).decode().strip()
+                print(response)
+                time.sleep(1)
+                result, frame = webcam.read()
+                if result:
+                    cv2.imwrite(args.image_output_path, frame)
+        except KeyboardInterrupt:
+            break
+
+finally:
+    sock.close()
+    webcam.release()

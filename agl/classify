@@ -1,0 +1,269 @@
+#!/usr/bin/python3
+
+import sys
+import argparse
+import socket
+import cv2
+import torch
+import pandas as pd
+import os
+import albumentations as A
+import time
+import json
+import kuksa_client
+
+from albumentations.pytorch import ToTensorV2
+from torch.nn import functional as F
+from torch import topk
+
+import torchvision.models as models
+import torch.nn as nn
+
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+
+
+def build_model(pretrained=True, fine_tune=False, num_classes=10):
+    model = models.mobilenet_v3_large(pretrained=pretrained)
+    if fine_tune:
+        # print('[INFO]: Fine-tuning all layers...')
+        for params in model.parameters():
+            params.requires_grad = True
+    elif not fine_tune:
+        # print('[INFO]: Freezing hidden layers...')
+        for params in model.parameters():
+            params.requires_grad = False
+
+    # Change the final classification head.
+    model.classifier[3] = nn.Linear(in_features=1280, out_features=num_classes)
+    return model
+
+
+def webcam_detection_enabled() -> bool:
+    try:
+        result = json.loads(
+            kuksa.getValue(
+                'Vehicle.ADAS.SpeedLimitDetection.IsEnabled'
+            )
+        )
+        # print(f'SpeedLimitDetection status: {result}')
+        value = result['data']['dp']['value']
+        if value == 'true':
+            return True
+        else:
+            return False
+    except Exception:
+        return False
+
+
+# Define the transforms, resize => tensor => normalize.
+transform = A.Compose([
+    A.Resize(224, 224),
+    A.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225]
+    ),
+    ToTensorV2(),
+])
+
+# Argument Parsing
+parser = argparse.ArgumentParser(
+    prog='classify',
+    description='Traffic Sign Detection',
+    epilog='SUSE Automotive Team'
+)
+
+# picture mode:
+#     read image file from socket, classify, report
+# webcam mode:
+#     poll on webcam (1sec), classify, report
+parser.add_argument('mode', choices=['picture', 'webcam'])
+
+# in webcam mode, sent speed values to kuksa val server
+parser.add_argument('--speed-to-kuksa', default=False, action="store_true")
+
+args = parser.parse_args()
+
+# predefined settings
+speed_limit_old = '0'
+approval_count = 0
+approval_at = 20
+webcam = None
+connection = None
+kuksa = None
+socket_path = '/run/traffic'
+device = 'cpu'
+kuksa_config = {
+    'port': 8090,
+    'protocol': 'ws',
+    'insecure': False
+}
+kuksa_token = open(
+    '/etc/kuksa_certificates/jwt/super-admin.json.token', 'r'
+).read().strip(os.linesep)
+
+# Class names.
+sign_names_df = pd.read_csv('/root/traffic-sign/signnames.csv')
+class_names = sign_names_df.SignName.tolist()
+
+# Initialize model, switch to eval model, load trained weights.
+model = build_model(
+    pretrained=False,
+    fine_tune=False,
+    num_classes=43
+).to(device)
+model = model.eval()
+model.load_state_dict(
+    torch.load(
+        '/root/traffic-sign/model.pth', map_location=device
+    )['model_state_dict']
+)
+
+if args.mode == 'webcam' and args.speed_to_kuksa:
+    kuksa = kuksa_client.KuksaClientThread(config=kuksa_config)
+    kuksa.start()
+    kuksa.authorize(token_or_tokenfile=kuksa_token)
+
+if args.mode == 'webcam' and webcam_detection_enabled():
+    webcam = cv2.VideoCapture(0)
+    result, image = webcam.read()
+    if not result:
+        raise Exception("No webcam device found")
+
+# remove the socket file if it already exists
+if not args.speed_to_kuksa:
+    try:
+        os.unlink(socket_path)
+    except OSError:
+        if os.path.exists(socket_path):
+            raise
+
+    # Create the Unix socket server and bind to it
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(socket_path)
+
+    # Listen for incoming connections, interpreted as image file names
+    server.listen(1)
+
+# accept connections
+while True:
+    try:
+        if not args.speed_to_kuksa:
+            connection, client_address = server.accept()
+
+        try:
+            while True:
+                if args.mode != 'webcam' and connection:
+                    # picture mode...
+                    data = connection.recv(1024)
+                    if not data:
+                        break
+                    image_filename = data.decode().strip()
+                    if os.path.exists(image_filename):
+                        image = cv2.imread(image_filename)
+                    else:
+                        connection.sendall(
+                            f'Err: {image_filename} does not exist\n'.encode()
+                        )
+                        continue
+                else:
+                    # webcam mode...
+                    while not webcam:
+                        if webcam_detection_enabled():
+                            webcam = cv2.VideoCapture(0)
+                            result, image = webcam.read()
+                        else:
+                            time.sleep(2)
+
+                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                # Apply the image transforms.
+                image_tensor = transform(image=image)['image']
+                # Add batch dimension.
+                image_tensor = image_tensor.unsqueeze(0)
+                # Forward pass through model.
+                outputs = model(image_tensor.to(device))
+                # Get the softmax probabilities.
+                probs = F.softmax(outputs, dim=1).data.squeeze()
+                # Get the class indices of top k probabilities.
+                class_idx = topk(probs, 1)[1].int()
+
+                if connection:
+                    # Send a response back to the client
+                    connection.sendall(
+                        'Classify: {0}: {1}\n'.format(
+                            int(class_idx),
+                            str(class_names[int(class_idx)])
+                        ).encode()
+                    )
+                if args.speed_to_kuksa:
+                    # Send speed classifications to kuksa
+                    # print(
+                    #     'Classify: {0}: {1}\n'.format(
+                    #         int(class_idx),
+                    #         str(class_names[int(class_idx)])
+                    #     )
+                    # )
+                    kuksa_limit = {
+                        0: '20',
+                        1: '30',
+                        2: '50',
+                        3: '60',
+                        4: '70',
+                        5: '80',
+                        7: '100',
+                        8: '120'
+                    }
+                    class_id = int(class_idx)
+
+                    if kuksa_limit.get(class_id):
+                        speed_limit = kuksa_limit.get(class_id)
+                    else:
+                        speed_limit = '0'
+
+                    if speed_limit_old == speed_limit:
+                        approval_count = approval_count + 1
+                    else:
+                        approval_count = approval_count - 1
+
+                    if approval_count >= approval_at and speed_limit == '30':
+                        # This speed limit is detected wrongly such that
+                        # approval needs to be at a higher bar
+                        approval_at = 50
+                    elif approval_count >= approval_at and speed_limit != '30':
+                        # back to normal
+                        approval_at = 20
+
+                    if approval_count >= approval_at:
+                        print(f'Update kuksa SpeedLimit {speed_limit}')
+                        json.loads(
+                            kuksa.setValue(
+                                'Vehicle.ADAS.SpeedLimitDetection.SpeedLimit',
+                                speed_limit
+                            )
+                        )
+                        approval_count = 0
+
+                    speed_limit_old = speed_limit
+
+                if args.mode == 'webcam':
+                    time.sleep(0.05)
+                    if webcam_detection_enabled():
+                        result, image = webcam.read()
+                    else:
+                        webcam.release()
+                        webcam = None
+
+        except BrokenPipeError:
+            pass
+
+        finally:
+            if connection:
+                connection.close()
+    except KeyboardInterrupt:
+        if os.path.exists(socket_path):
+            os.unlink(socket_path)
+        if webcam:
+            webcam.release()
+        if kuksa:
+            kuksa.stop()
+        sys.exit(0)
