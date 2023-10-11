@@ -88,6 +88,7 @@ args = parser.parse_args()
 speed_limit_old = '0'
 approval_count = 0
 approval_at = 20
+approval_at_thirty = 50
 webcam = None
 connection = None
 kuksa = None
@@ -225,15 +226,9 @@ while True:
                     else:
                         approval_count = approval_count - 1
 
-                    if approval_count >= approval_at and speed_limit == '30':
-                        # This speed limit is detected wrongly such that
-                        # approval needs to be at a higher bar
-                        approval_at = 50
-                    elif approval_count >= approval_at and speed_limit != '30':
-                        # back to normal
-                        approval_at = 20
-
                     if approval_count >= approval_at:
+                        if speed_limit == '30' and approval_count < approval_at_thirty:
+                            continue
                         print(f'Update kuksa SpeedLimit {speed_limit}')
                         json.loads(
                             kuksa.setValue(
