@@ -225,6 +225,8 @@ while True:
                         approval_count = approval_count + 1
                     else:
                         approval_count = approval_count - 1
+                        if approval_count < 0:
+                            approval_count = 0
 
                     if approval_count >= approval_at:
                         if speed_limit == '30' and approval_count < approval_at_thirty:
