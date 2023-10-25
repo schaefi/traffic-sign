@@ -87,8 +87,8 @@ args = parser.parse_args()
 # predefined settings
 speed_limit_old = '0'
 approval_count = 0
-approval_at = 20
-approval_at_thirty = 50
+approval_at = 3
+approval_at_thirty = 10
 webcam = None
 connection = None
 kuksa = None
@@ -198,12 +198,12 @@ while True:
                     )
                 if args.speed_to_kuksa:
                     # Send speed classifications to kuksa
-                    # print(
-                    #     'Classify: {0}: {1}\n'.format(
-                    #         int(class_idx),
-                    #         str(class_names[int(class_idx)])
-                    #     )
-                    # )
+                    print(
+                        'Classify: {0}: {1}'.format(
+                            int(class_idx),
+                            str(class_names[int(class_idx)])
+                        )
+                    )
                     kuksa_limit = {
                         0: '20',
                         1: '30',
